@@ -1,0 +1,149 @@
+# Комплект-лид-магнит L02 «Локальный стенографист».
+# Автономный контур: faster-whisper (инференс локальный, int8, CPU) + Ollama (локальная модель).
+# Задача контура: расшифровка встречи и подготовка протокола БЕЗ облака.
+#
+# РЕЖИМ РАБОТЫ БЕЗ ИНТЕРНЕТА:
+#   * образы и модели скачиваются ОДИН раз заранее (docker pull, ollama pull на хосте);
+#   * после этого `docker compose up` работает при отключённой сети — во время работы
+#     контур никуда не ходит: ни в облако, ни в реестры, ни за телеметрией;
+#   * сеть `localnet` объявлена internal: true — у контейнеров нет маршрута в WAN;
+#   * том с аудио подключён ТОЛЬКО НА ЧТЕНИЕ (:ro) — вход контура нельзя изменить изнутри;
+#   * каталог с результатами подключён на запись — туда падают transcript.txt и protocol.md.
+#
+# ПОРТЫ: наружу не публикуются, сервисы связаны внутренней сетью по именам
+#   (http://faster-whisper:9000, http://ollama:11434).
+#   Для отладки с хоста можно раскомментировать локальную публикацию 127.0.0.1:<port>:<port>
+#   (не 0.0.0.0 — иначе контур станет доступен из локальной сети, что противоречит идее).
+#
+# ПЕРЕМЕННЫЕ (образец — .env.example, копируется в .env):
+#   WHISPER_MODEL  — модель faster-whisper: small или medium (по умолчанию small)
+#   OLLAMA_MODEL   — локальная модель Ollama для составления протокола
+#   ASR_BACKEND    — service (через HTTP-сервис faster-whisper) или local (импорт faster_whisper)
+#   AUDIO_DIR      — каталог с исходными записями (подключается read-only)
+#   AUDIO_FILE     — имя файла записи внутри AUDIO_DIR
+#   OUTPUT_DIR     — куда складывать transcript.txt и protocol.md
+
+name: l02-local-stenographer
+
+services:
+  # --- Расшифровка: faster-whisper, int8, CPU, без выхода в сеть ---
+  faster-whisper:
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    container_name: l02-faster-whisper
+    restart: unless-stopped
+    environment:
+      ASR_MODEL: ${WHISPER_MODEL:-small}      # small или medium
+      ASR_ENGINE: faster_whisper              # движок faster-whisper
+      ASR_DEVICE: cpu                         # вычисления на CPU
+      ASR_MODEL_PATH: /models                 # кэш моделей в томе (не перекачивать при рестарте)
+      MODEL_IDLE_TIMEOUT: ${WHISPER_IDLE_TIMEOUT:-0}   # 0 = выгружать модель сразу после запроса
+    volumes:
+      - whisper-models:/models
+      - ${AUDIO_DIR:-./audio}:/audio:ro       # вход только на чтение
+    networks:
+      - localnet
+    expose:
+      - "9000"
+    # ports:
+    #   - "127.0.0.1:9000:9000"               # локальная публикация для отладки (по желанию)
+    healthcheck:
+      # В образе есть python — проверяем /health без внешних утилит.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=5).status == 200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # --- Локальная LLM для составления протокола ---
+  ollama:
+    image: ollama/ollama:latest
+    container_name: l02-ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      # Модель выгружается из VRAM сразу после ответа — иначе на карте 4 ГБ
+      # не хватит памяти на следующий запрос.
+      OLLAMA_KEEP_ALIVE: "0"
+    volumes:
+      - ollama-models:/root/.ollama           # модели Ollama живут в томе, переживают рестарт
+    networks:
+      - localnet
+    expose:
+      - "11434"
+    # ports:
+    #   - "127.0.0.1:11434:11434"             # нужно, чтобы заранее закачать модель: OLLAMA_HOST=127.0.0.1:11434 ollama pull <model>
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # --- Оркестратор: расшифровка -> выгрузка VRAM -> протокол ---
+  worker:
+    image: python:3.11-slim
+    container_name: l02-worker
+    working_dir: /app
+    # Одноразовый прогон: отработал — вышел. restart: unless-stopped здесь означал бы
+    # бесконечный цикл перезапуска, поэтому для воркера стоит "no".
+    restart: "no"
+    env_file:
+      # Порядок важен: значения из .env перекрывают значения из .env.example.
+      - path: .env.example
+        required: false
+      - path: .env
+        required: false
+    environment:
+      ASR_BACKEND: ${ASR_BACKEND:-service}
+      ASR_URL: http://faster-whisper:9000
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
+      HF_HOME: /models/hf
+    command:
+      - python
+      - /app/worker.py
+      - --audio
+      - /audio/${AUDIO_FILE:-meeting.wav}
+      - --asr-backend
+      - ${ASR_BACKEND:-service}
+      - --asr-url
+      - http://faster-whisper:9000
+      - --ollama-url
+      - http://ollama:11434
+      - --ollama-model
+      - ${OLLAMA_MODEL:-qwen2.5:3b}
+      - --whisper-model
+      - ${WHISPER_MODEL:-small}
+      - --system-prompt
+      - /app/system_prompt.txt
+      - --output-dir
+      - /output
+    volumes:
+      - .:/app                                 # worker.py и system_prompt.txt
+      - ${OUTPUT_DIR:-./out}:/output           # transcript.txt и protocol.md
+      - ${AUDIO_DIR:-./audio}:/audio:ro        # вход только на чтение
+      - whisper-models:/models                 # общий кэш моделей (HF_HOME) с faster-whisper
+    networks:
+      - localnet
+    depends_on:
+      faster-whisper:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+
+networks:
+  # internal: true — у контейнеров нет шлюза наружу; контур работает офлайн.
+  localnet:
+    driver: bridge
+    internal: true
+
+volumes:
+  whisper-models:
+  ollama-models:
